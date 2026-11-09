@@ -1,0 +1,225 @@
+# Runs Hermes's own Anytype identity as a headless anytype-cli node.
+#
+# Confirmed against anyproto/any-sync-dockercompose's own (optional,
+# commented-out) anytype-cli service block -- same bootstrap-then-serve
+# pattern, and (as of beta round 8) the plain official image again. A forked,
+# patched image (github.com/thisispete/anytype-cli) was tried first -- see
+# docs/design.md Section 10 for the full investigation -- but a controlled
+# 5-trial-per-image comparison showed the patch had zero measurable effect
+# (3/5 success either way). The image was never the fix; kept here for
+# history, not maintained going forward.
+#
+# ############################################################################
+# # REQUIRED macOS Docker Desktop setting, or this will fail unpredictably: #
+# ############################################################################
+# Settings -> Resources -> Network -> "Use kernel networking for UDP". Off by
+# default. Without it, auto-login against a *previously created* stored
+# identity (not fresh account creation, which is unaffected) fails
+# intermittently with a QUIC/UDP DeadlineExceeded error -- 0% success across
+# every test run in this project's beta testing without it, ~60% per-attempt
+# WITH it (still not 100% -- see the retry logic on the anytype-cli service
+# below, added specifically because this setting alone isn't fully
+# deterministic). This is a VM-wide setting; toggling it restarts every
+# container on the host, not just this one.
+#
+# This file is for the DEFAULT ANYTYPE NETWORK case (no self-hosted sync
+# backend). If you're self-hosting your own any-sync backend instead, don't
+# use this file -- uncomment the anytype-cli block already present in your
+# any-sync-dockercompose checkout's docker-compose.yml so the bot shares
+# your network.yml and actually lands on your network.
+#
+# Usage:
+#   docker compose -f docker-compose.anytype-bot.yml up -d
+#
+#   # Back up the account recovery key immediately, then delete it from the
+#   # container -- it's the ONLY way to recover this identity, and it's
+#   # deliberately NOT in `docker logs` (see the bootstrap command's comment
+#   # below for why that matters):
+#   docker compose -f docker-compose.anytype-bot.yml exec anytype-cli cat /root/.anytype/ACCOUNT_RECOVERY_KEY.txt
+#   # copy that into a password manager, then:
+#   docker compose -f docker-compose.anytype-bot.yml exec anytype-cli rm /root/.anytype/ACCOUNT_RECOVERY_KEY.txt
+#
+#   docker compose -f docker-compose.anytype-bot.yml exec anytype-cli anytype auth apikey create hermes-integration
+#   # from your desktop app: Share Space -> copy invite link
+#   docker compose -f docker-compose.anytype-bot.yml exec anytype-cli anytype space join "<invite-link>"
+#   # then approve the join request in-app -- see docs/design.md Section 10
+
+services:
+  anytype-cli-bootstrap:
+    image: "ghcr.io/anyproto/anytype-cli:${ANYTYPE_CLI_VERSION:-latest}"
+    restart: "no"
+    volumes:
+      - anytype-cli-data:/root/.anytype
+    environment:
+      - ANYTYPE_CLI_ACCOUNT_NAME=${ANYTYPE_CLI_ACCOUNT_NAME:-hermes}
+    # `anytype` is the image's own ENTRYPOINT, already on PATH via
+    # /usr/local/bin -- NOT /app/anytype (/app is just the image's empty
+    # WorkingDir, confirmed by inspecting the actual image; a beta tester
+    # hit this exact wrong-path bug on a real install attempt).
+    #
+    # entrypoint/command are deliberately split into list form (rather than
+    # one `entrypoint: /bin/sh -c "..."` scalar) so the script below is
+    # passed to the shell as a single literal argv element -- no risk of a
+    # second, ambiguous round of shell-style tokenizing on top of Compose's
+    # own `${...}` interpolation, which a plain scalar form would require
+    # and which isn't practical to verify without a real `docker compose
+    # config` run. `$$` below is still Compose's own interpolation escape
+    # (needed regardless of this form) -- not shell escaping.
+    #
+    # No retry loop here, unlike the main service below -- account
+    # *creation* (as opposed to recovering an existing stored account) was
+    # never observed to be flaky across any round of beta testing, including
+    # the controlled 5-trial batches. Only auto-login of an existing account
+    # showed the intermittent failure.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /root/.anytype/config.json ]; then
+          echo 'Creating bot account...'
+          anytype serve &
+          SERVER_PID=$$!
+          sleep 2
+          # `auth create`'s own stdout/stderr is redirected to a file on the
+          # persistent volume instead of this container's stdout -- a beta
+          # tester found it prints the account's recovery key in plaintext,
+          # and letting that hit `docker logs` puts a wallet-seed-phrase
+          # -equivalent secret somewhere far more widely readable and
+          # longer-lived than intended (log aggregators, anyone with
+          # `docker logs` access, accidentally pasted into a chat/ticket
+          # while debugging -- which is exactly what happened during beta
+          # testing). Only a non-secret status line below goes to stdout.
+          anytype auth create "$$ANYTYPE_CLI_ACCOUNT_NAME" > /root/.anytype/ACCOUNT_RECOVERY_KEY.txt 2>&1
+          CREATE_STATUS=$$?
+          chmod 600 /root/.anytype/ACCOUNT_RECOVERY_KEY.txt 2>/dev/null || true
+          sleep 5
+          kill $$SERVER_PID 2>/dev/null || true
+          wait $$SERVER_PID 2>/dev/null || true
+          if [ $$CREATE_STATUS -ne 0 ]; then
+            echo 'Bot account creation failed -- see /root/.anytype/ACCOUNT_RECOVERY_KEY.txt in the volume for the command output' >&2
+            exit 1
+          fi
+          echo "Bot account created. Its recovery key -- the ONLY way to restore this identity -- was written to /root/.anytype/ACCOUNT_RECOVERY_KEY.txt in the anytype-cli-data volume, NOT printed here. Copy it to a password manager now, then delete that file (see this file's header comment for the exact commands). Do not leave it sitting in the volume."
+        else
+          echo 'Bot account already exists, skipping bootstrap'
+        fi
+    # `auth create`'s exit status is deliberately checked and NOT swallowed
+    # -- a real failure here must fail the bootstrap container, so
+    # `anytype-cli`'s `depends_on: condition: service_completed_successfully`
+    # actually blocks it from starting. Without this, a beta tester found the
+    # main container came up "healthy" (healthcheck only checked the port was
+    # open) with a permanently empty account and no visible error short of
+    # `docker logs`.
+
+  anytype-cli:
+    image: "ghcr.io/anyproto/anytype-cli:${ANYTYPE_CLI_VERSION:-latest}"
+    restart: unless-stopped
+    depends_on:
+      anytype-cli-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      # Only the REST API needs publishing -- this plugin never speaks
+      # anytype-cli's gRPC ports (31010/31011).
+      - "127.0.0.1:${ANYTYPE_CLI_API_PORT:-31012}:31012"
+    volumes:
+      - anytype-cli-data:/root/.anytype
+    environment:
+      # How many times to restart `anytype serve` if auto-login against the
+      # stored account doesn't succeed. At the ~60% per-attempt success rate
+      # measured with "Use kernel networking for UDP" enabled (beta round 8,
+      # 5-trial batches on both the official and a patched image -- see
+      # docs/design.md Section 10), independent per-attempt failure
+      # probability is ~0.4; N retries gives roughly 0.4^N expected overall
+      # failure. 10 retries -> ~0.4^10, effectively never.
+      - ANYTYPE_CLI_LOGIN_RETRIES=${ANYTYPE_CLI_LOGIN_RETRIES:-10}
+    # Overrides the image's default `ENTRYPOINT ["anytype"] CMD ["serve"]".
+    # `anytype serve` does NOT exit or crash when its own internal auto-login
+    # retry (3 attempts, ~2s apart, hardcoded in anytype-cli) is exhausted --
+    # it logs the failure and keeps running, gRPC server up but permanently
+    # unauthenticated. That means Docker's own `restart: unless-stopped`
+    # policy never even triggers (it only acts on process exit), and the
+    # container sits there reporting "healthy" (the healthcheck below only
+    # checks the port answers, not that login succeeded) while being useless
+    # for anything that needs an authenticated session. This wrapper
+    # substitutes for that: it watches anytype-heart's own log lines for the
+    # actual outcome and, on failure, kills and restarts the whole process
+    # itself -- a fresh process start re-triggers anytype-heart's internal
+    # 3-attempt sequence again, giving another independent shot at the ~60%
+    # per-attempt success rate rather than giving up after one.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        : > /tmp/serve.log
+        tail -f /tmp/serve.log &
+        TAIL_PID=$$!
+        attempt=1
+        while [ "$$attempt" -le "$$ANYTYPE_CLI_LOGIN_RETRIES" ]; do
+          START_LINE=$$(wc -l < /tmp/serve.log)
+          echo "=== anytype serve: outer attempt $$attempt/$$ANYTYPE_CLI_LOGIN_RETRIES ===" >> /tmp/serve.log
+          # --listen-address is required for anything outside this
+          # container's own network namespace to reach the REST API.
+          # Confirmed by direct testing (hermes-anytype plugin wiring, first
+          # live round): the default 127.0.0.1 bind means `docker exec`
+          # commands work fine (real same-netns loopback), but a request
+          # routed through Docker Desktop's host-published-port path --
+          # from the host itself, or from another container via
+          # host.docker.internal -- gets a TCP handshake followed by a
+          # silent, 100%-reproducible empty reply, never reaching the
+          # listener. Binding 0.0.0.0 here fixes that; the host-side
+          # publish below stays scoped to 127.0.0.1 so external network
+          # exposure is unchanged.
+          anytype serve --listen-address 0.0.0.0:31012 >> /tmp/serve.log 2>&1 &
+          SERVER_PID=$$!
+          waited=0
+          RESULT=""
+          while [ "$$waited" -lt 60 ]; do
+            NEW_LOG=$$(tail -n +"$$((START_LINE + 1))" /tmp/serve.log)
+            if echo "$$NEW_LOG" | grep -qF "Successfully logged in using stored account key"; then
+              RESULT="success"
+            elif echo "$$NEW_LOG" | grep -qF "No stored account key found, skipping auto-login"; then
+              RESULT="success"
+            elif echo "$$NEW_LOG" | grep -qF "Failed to auto-login with account key after"; then
+              RESULT="failure"
+            fi
+            [ -n "$$RESULT" ] && break
+            sleep 1
+            waited=$$((waited + 1))
+          done
+          if [ "$$RESULT" = "success" ]; then
+            echo "=== auto-login OK on outer attempt $$attempt -- handing off ===" >> /tmp/serve.log
+            wait "$$SERVER_PID"
+            exit $$?
+          fi
+          echo "=== outer attempt $$attempt result: $${RESULT:-timeout after 60s} -- restarting ===" >> /tmp/serve.log
+          kill "$$SERVER_PID" 2>/dev/null || true
+          wait "$$SERVER_PID" 2>/dev/null || true
+          attempt=$$((attempt + 1))
+          sleep 2
+        done
+        echo "=== giving up after $$ANYTYPE_CLI_LOGIN_RETRIES outer attempts -- auto-login never succeeded ===" >> /tmp/serve.log
+        kill "$$TAIL_PID" 2>/dev/null || true
+        exit 1
+    healthcheck:
+      # Checks for an actual account, not just an open port -- "port open"
+      # was true even with a permanently empty account (see the bootstrap
+      # command's comment above), which is exactly what let that bug hide
+      # behind a "healthy" container status. Still doesn't check that
+      # auto-login actually *succeeded* (vs. is mid-retry) -- the retry
+      # wrapper above owns that concern instead.
+      test: ["CMD-SHELL", "test -f /root/.anytype/config.json && nc -z 127.0.0.1 31010 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      # Generous: a full worst-case retry cycle (10 attempts x up to 60s
+      # each, plus 2s between) can take several minutes. Failures during
+      # start_period don't count toward "unhealthy" at all (Docker's own
+      # semantics), so this just avoids a spurious unhealthy status during a
+      # legitimate multi-attempt retry run.
+      start_period: 600s
+      retries: 3
+
+volumes:
+  # Holds the "hermes" account's keys -- this is the identity data
+  # docs/design.md Section 10 warns needs backing up. Losing this volume
+  # without a backup loses the account. The recovery key itself (see the
+  # bootstrap command above) also lands here transiently -- back it up and
+  # delete it; don't treat this volume as its permanent home.
+  anytype-cli-data:

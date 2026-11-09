@@ -1,0 +1,55 @@
+name: anytype-platform
+label: Anytype
+kind: platform
+version: 0.1.0
+description: >
+  Anytype gateway adapter for Hermes Agent. Connects to a self-hosted (or
+  cloud) Anytype space's native chat via its local REST API + SSE stream,
+  and gives the agent live chat presence plus schema-driven tools to
+  search/create/update the space's typed objects.
+author: thisispete
+# Confirmed real and functionally required, not just a `hermes doctor` lint
+# nit -- see plugins/platforms/a2a/plugin.yaml in NousResearch/hermes-agent:
+# declaring tools here is what makes discovery import tools.py in contexts
+# where this plugin is otherwise deferred (CLI/TUI, not just the gateway
+# process) -- without it, the tools may never register at all in those
+# contexts, not merely warn.
+provides_tools:
+  - anytype_search_objects
+  - anytype_get_type
+  - anytype_create_object
+  - anytype_update_object
+requires_env:
+  - name: ANYTYPE_API_KEY
+    description: "API key for Hermes's own Anytype identity -- see docs/design.md Section 10 for setup"
+    prompt: "Anytype API key"
+    password: true
+  - name: ANYTYPE_API_BASE_URL
+    description: "Local API base URL for the node running Hermes's identity. Usually http://host.docker.internal:31012, NOT 127.0.0.1 -- Hermes and the bot node are normally separate Docker Compose projects, so 127.0.0.1 from inside Hermes's own container is Hermes's own loopback. See .env.example."
+    prompt: "Anytype API base URL"
+    password: false
+  - name: ANYTYPE_SPACE_ID
+    description: "The target space's ID"
+    prompt: "Anytype space ID"
+    password: false
+optional_env:
+  - name: ANYTYPE_CHATS
+    description: "Comma-separated chat_ids to monitor. Unset = auto-discover all chats in the space."
+    prompt: "Chat IDs to monitor (comma-separated, blank for all)"
+    password: false
+  - name: ANYTYPE_REQUIRE_MENTION
+    description: "Require the mention trigger in monitored chats (default true). Set false for free-response everywhere."
+    prompt: "Require mention? (true/false)"
+    password: false
+  - name: ANYTYPE_MENTION_TRIGGER
+    description: "Trigger string for mention mode. Default: @hermes"
+    prompt: "Mention trigger"
+    password: false
+  - name: ANYTYPE_FREE_RESPONSE_CHATS
+    description: "Comma-separated chat_ids that respond to everything regardless of ANYTYPE_REQUIRE_MENTION"
+    prompt: "Free-response chat IDs (comma-separated)"
+    password: false
+  - name: ANYTYPE_ACCOUNT_ID
+    description: "This identity's own Anytype account id (printed during `anytype auth create` -- see docs/design.md Section 10). Needed for real @mention detection in the UI; without it, mention mode only catches people typing the trigger string as literal text."
+    prompt: "Anytype account id (optional, enables real @mention detection)"
+    password: false
