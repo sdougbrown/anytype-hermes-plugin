@@ -310,7 +310,7 @@ Two confirmed-live findings from the first night of real two-way traffic in a
 page discussion, both fixed and verified at the wire level:
 
 1. **v1 message reads return empty text for other authors' messages.**
-   Symptom: every message Doug sent from the desktop app arrived at the
+   Symptom: every message Doug sent from the iOS app arrived at the
    gateway with `content.text == ""` (REST read and v1 SSE stream both) —
    id/creator/timestamps intact, body silently gone — so the bot kept
    replying "your message came through empty". The bot's own messages read
@@ -332,7 +332,7 @@ page discussion, both fixed and verified at the wire level:
    Link=5, ...` — there is no "code" value, and the middleware silently
    coerces unknown mark strings to enum value 0, i.e. **Strikethrough**
    (same fallback that coerces "underline"). Every backtick span the bot
-   sent therefore rendered struck-through in the desktop client. Fixed in
+   sent therefore rendered struck-through in the client. Fixed in
    `_markdown_to_marks` (`code` → `"keyboard"`), verified live: a
    `keyboard` mark persists as `keyboard`, a `code` mark comes back as
    `strikethrough`.
@@ -340,14 +340,14 @@ page discussion, both fixed and verified at the wire level:
 Also that night: the bot node's `ghcr.io/anyproto/anytype-cli` image was
 updated Oct 13 → Nov 5 build (container recreated via
 `anytype-bot.service`; harmless but keeps the node current with the
-desktop app's newer discussion work). Chat *listing* for discussions
+iOS app's newer discussion work). Chat *listing* for discussions
 (v2 list with `include=discussions`) had landed earlier the same evening.
 
 ## 14. Attachment visibility (2026-11-08, later that night)
 
-An object attached in the desktop discussion UI ("attach the hockey draft
-discussion chat") never reached the bot: the message arrives with
-`attachments: []` on both v1 and v2 reads, so desktop attaches are almost
+An object attached in the iOS app's discussion editor ("attach the hockey
+draft discussion chat") never reached the bot: the message arrives with
+`attachments: []` on both v1 and v2 reads, so iOS attaches are almost
 certainly stored as structured message *blocks* (`MessageBlockLink`), which
 the REST read does not expose at all (v1: `blocks: null`; v2: key omitted) —
 the same REST-can't-see-blocks ceiling as Section 13's code-fence finding.
@@ -366,6 +366,6 @@ resolution logs a warning and degrades to the raw id, never blocks the
 message. Mentions/should_respond still evaluate on the original text only —
 an attachment can never trigger a response by itself.
 
-Remaining gap (needs middleware/gRPC work, not plugin work): desktop-side
+Remaining gap (needs middleware/gRPC work, not plugin work): iOS-side
 attaches that land in `blocks`, and inbound-to-bot attaches can't be sent
 back with rich links — outbound stays text+marks.
