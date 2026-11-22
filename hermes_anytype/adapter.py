@@ -40,7 +40,11 @@ logger = logging.getLogger(__name__)
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _SENT_ID_CACHE_SIZE = 500
-_SEEN_ID_CACHE_SIZE = 500
+# Large enough to hold every primed id of a multi-chat connect (2026-11-22:
+# with _PRIME_MESSAGE_LIMIT=200 and six+ chats, priming alone can push
+# >500 ids through this cache) -- though the per-chat watermarks are the
+# real replay defense now; this only needs to catch near-duplicates.
+_SEEN_ID_CACHE_SIZE = 2000
 # How many of a chat's existing messages to fetch when priming the
 # already-seen set (see _run_chat's priming step, docs/design.md Section
 # 4.1, beta round 13). A confirmed real API behavior: a fresh SSE
@@ -207,6 +211,18 @@ class AnytypeAdapter(BasePlatformAdapter):
         self._tasks: list[asyncio.Task] = []
         self._recently_sent_ids: list[str] = []
         self._seen_incoming_ids: list[str] = []
+        # Per-chat replay watermark (confirmed live 2026-11-22): the
+        # seen-id set above is a bounded FIFO shared across ALL chats, and
+        # a week of traffic evicts days-old ids -- so when the bot node
+        # restarts and the SSE stream replays chat history, evicted old
+        # messages looked brand-new and the bot replied into dormant
+        # chats (five sessions resurrected at once). The watermark is the
+        # eviction-proof backstop: per chat, the created_at of the newest
+        # message ever handled; any stream message at-or-before it is
+        # history, whatever the id cache remembers. ISO-8601 UTC strings
+        # ('...Z', same format from both the v2 read and stream paths via
+        # _normalize_v2_message) compare correctly as plain strings.
+        self._chat_watermarks: dict[str, str] = {}
         # Self-identity resolved from the API at connect time (defense in
         # depth against a stale ANYTYPE_ACCOUNT_ID in the environment):
         # the member list gives this account's participant id (the exact
@@ -435,6 +451,14 @@ class AnytypeAdapter(BasePlatformAdapter):
             message_id = message.get("id")
             if message_id:
                 self._remember_seen(message_id)
+        # Seed/advance the replay watermark from the newest primed
+        # message (2026-11-22 fix, see _chat_watermarks in __init__).
+        timestamps = [ts for m in messages if (ts := m.get("created_at"))]
+        if timestamps:
+            newest = max(timestamps)
+            current = self._chat_watermarks.get(chat_id)
+            if current is None or newest > current:
+                self._chat_watermarks[chat_id] = newest
 
     async def _run_chat(self, chat_id: str) -> None:
         backoff = _RECONNECT_BASE_DELAY
@@ -574,6 +598,27 @@ class AnytypeAdapter(BasePlatformAdapter):
         # case above.
         if message_id and message_id in self._seen_incoming_ids:
             return  # already processed -- a replayed/re-delivered message, not a new one
+        # Replay watermark (2026-11-22, see _chat_watermarks in __init__):
+        # a message at-or-before the newest already-handled timestamp for
+        # this chat is history, even if its id was evicted from the
+        # bounded seen-id cache. Strict '<' so a genuine message in the
+        # same second as the watermark still gets through; equal-and-older
+        # replays of it are caught by the id cache above.
+        message_ts = message.get("created_at") or ""
+        watermark = self._chat_watermarks.get(chat_id)
+        if watermark and message_ts and message_ts < watermark:
+            if message_id:
+                self._remember_seen(message_id)
+            logger.info(
+                "Anytype: dropped replayed history message in chat %s (ts %s <= watermark)",
+                chat_id,
+                message_ts,
+            )
+            return
+        if message_ts:
+            current = self._chat_watermarks.get(chat_id)
+            if current is None or message_ts > current:
+                self._chat_watermarks[chat_id] = message_ts
         if message_id:
             self._remember_seen(message_id)
         # Confirmed live (beta round 11, docs/design.md Section 4.1): message
