@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from gateway.config import Platform, PlatformConfig
@@ -69,6 +70,11 @@ _PRIME_MESSAGE_LIMIT = 200
 # move with it.
 _STREAM_ACTIVITY_TIMEOUT = 60.0
 _CHAT_DISCOVERY_INTERVAL = 60.0
+# How far back a newly discovered chat's backlog gets processed (2026-11-23):
+# messages newer than this go through the normal handler when the chat is
+# first picked up by discovery; older history is prime-only. Keeps a
+# long-dormant chat discovered late from firing ancient messages.
+_BACKLOG_MAX_AGE_SECONDS = 6 * 3600
 
 # Inline Markdown span -> Anytype chat mark. Verified live against the
 # middleware (2026-11-08): bold/italic/link/strikethrough/"keyboard" all
@@ -328,7 +334,9 @@ class AnytypeAdapter(BasePlatformAdapter):
                 if not chat_id or chat_id in self._chat_ids:
                     continue
                 self._chat_ids.add(chat_id)
-                task = asyncio.create_task(self._run_chat(chat_id))
+                task = asyncio.create_task(
+                    self._run_chat(chat_id, process_backlog=True)
+                )
                 task.add_done_callback(self._log_run_chat_done)
                 self._tasks.append(task)
                 logger.info("Anytype: discovered new chat %s -- streaming", chat_id)
@@ -460,9 +468,49 @@ class AnytypeAdapter(BasePlatformAdapter):
             if current is None or newest > current:
                 self._chat_watermarks[chat_id] = newest
 
-    async def _run_chat(self, chat_id: str) -> None:
+    async def _process_backlog(self, chat_id: str, require_mention: bool) -> None:
+        """Run a newly discovered chat's recent history through the normal
+        handler (2026-11-23: a page discussion created and commented before
+        the discovery loop's next pass had both messages primed as seen and
+        never answered). Bounded by age so a long-dormant chat discovered
+        late can't fire ancient messages; the same read primes afterwards,
+        so the stream's replay stays deduped."""
+        try:
+            messages = await self.client.get_chat_messages(chat_id, limit=_PRIME_MESSAGE_LIMIT)
+        except Exception:
+            logger.exception(
+                "Anytype: failed to read backlog for newly discovered chat %s",
+                chat_id,
+            )
+            return
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=_BACKLOG_MAX_AGE_SECONDS)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for message in messages:
+            ts = message.get("created_at") or ""
+            if ts and ts < cutoff:
+                continue
+            try:
+                await self._handle_anytype_message(chat_id, message, require_mention)
+            except Exception:
+                logger.exception(
+                    "Anytype: backlog message %s in chat %s failed",
+                    message.get("id"),
+                    chat_id,
+                )
+
+    async def _run_chat(self, chat_id: str, process_backlog: bool = False) -> None:
         backoff = _RECONNECT_BASE_DELAY
         require_mention = self._require_mention and chat_id not in self._free_response_chats
+        # Newly discovered chats (the 2026-11-23 lesson): messages posted
+        # between the chat's creation and the discovery loop's next pass
+        # would be primed as seen and silently swallowed -- the whole
+        # reason a user creates a discussion is to get a response. Process
+        # the recent backlog through the normal handler BEFORE priming,
+        # so the usual gates (self-echo filters, mention requirement)
+        # still apply; then prime so the stream's replay dedups.
+        if process_backlog:
+            await self._process_backlog(chat_id, require_mention)
         await self._prime_seen_messages(chat_id)
         while not self._closing:
             reconnect_reason: str | None = None
